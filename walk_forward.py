@@ -1,0 +1,189 @@
+"""Walk-forward / out-of-sample robustness check for the ranked allocation
+strategy.
+
+What this does and does NOT test
+---------------------------------
+The strategy's DAILY TRADING DECISIONS are already causal / lookahead-free
+(factors use only trailing data, signals are shifted by one trading day
+before being acted on -- see backtest.py). What is NOT causal is the
+strategy's DESIGN: the choice of 12-1 momentum, downside deviation, the
+price-aware volume factor, quarterly rebalancing, and the hysteresis buffer
+were all arrived at by iterating and looking at full-period results. That is
+the actual overfitting exposure -- not lookahead bias in execution, but
+hindsight in strategy selection.
+
+This module does NOT attempt to reproduce that design process fold-by-fold
+(that would require an automated factor-search framework standing in for
+what was really a theory-driven, human-guided process -- not a faithful
+simulation of it). What it DOES check, honestly:
+
+1. **Sequential fold backtest**: split the full history into N chronological,
+   non-overlapping chunks and run an INDEPENDENT backtest on each (fresh
+   capital every fold) using the CURRENT, FROZEN configuration. If the
+   strategy's edge is concentrated in one or two chunks and roughly flat or
+   negative in the others, that's a strong overfitting/regime-luck signal.
+   If it's positive and beats its own chunk's Nifty 50 return in most/all
+   folds, that's real (if not conclusive) evidence of a persistent effect.
+
+2. **Rolling IC**: a trailing-window view of Total_Rank's Spearman IC over
+   time, to see whether the factor's predictive power has been persistent,
+   decaying, or concentrated in a specific stretch of history.
+"""
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+import config
+import backtest
+import metrics
+import ic_analysis
+import main as m
+
+OUT_DIR = "output"
+
+
+def chronological_folds(dates: pd.DatetimeIndex, n_folds: int):
+    """Split `dates` into n_folds contiguous, roughly-equal chunks, in order."""
+    edges = np.linspace(0, len(dates), n_folds + 1, dtype=int)
+    return [dates[edges[i]:edges[i + 1]] for i in range(n_folds)]
+
+
+def run_fold(panels, full_daily_weights, benchmark_series, fold_dates, label):
+    close_px = panels["Close"].loc[fold_dates]
+    open_px = panels["Open"].loc[fold_dates]
+    daily_w = full_daily_weights.loc[fold_dates]
+    result = backtest.run_backtest(open_px, close_px, daily_w)
+    s = metrics.summary(result["nav"], label)
+
+    bm_seg = benchmark_series.reindex(fold_dates).ffill().dropna()
+    bm_cagr = metrics.cagr(bm_seg) * 100 if len(bm_seg) > 1 else float("nan")
+    bm_sharpe = metrics.sharpe_ratio(metrics.daily_returns(bm_seg)) if len(bm_seg) > 1 else float("nan")
+
+    return {
+        "fold": label,
+        "start": fold_dates[0].date(),
+        "end": fold_dates[-1].date(),
+        "strategy_cagr_pct": s["cagr_pct"],
+        "strategy_sharpe": s["sharpe"],
+        "strategy_maxdd_pct": s["max_drawdown_pct"],
+        "nifty_cagr_pct": bm_cagr,
+        "nifty_sharpe": bm_sharpe,
+        "beat_nifty": s["cagr_pct"] > bm_cagr,
+    }
+
+
+def rolling_ic(ic_series: pd.Series, window: int):
+    """Trailing-window mean IC and t-stat, one point per rebalance date once
+    `window` prior observations are available."""
+    out = {}
+    for i in range(window, len(ic_series) + 1):
+        chunk = ic_series.iloc[i - window:i]
+        d = ic_series.index[i - 1]
+        mean_ic = chunk.mean()
+        std_ic = chunk.std(ddof=1)
+        t_stat = mean_ic / (std_ic / np.sqrt(window)) if std_ic > 0 else np.nan
+        out[d] = (mean_ic, t_stat)
+    return pd.DataFrame(out, index=["mean_ic", "t_stat"]).T
+
+
+def plot_folds(fold_df: pd.DataFrame, path: str):
+    fig, ax = plt.subplots(figsize=(11, 6))
+    x = np.arange(len(fold_df))
+    width = 0.35
+    colors_strat = ["#2a9d8f" if b else "#e76f51" for b in fold_df["beat_nifty"]]
+    ax.bar(x - width / 2, fold_df["strategy_cagr_pct"], width, color=colors_strat, label="Strategy")
+    ax.bar(x + width / 2, fold_df["nifty_cagr_pct"], width, color="#888888", label="Nifty 50")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{row['fold']}\n{row['start']} to {row['end']}" for _, row in fold_df.iterrows()],
+                        fontsize=8)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_ylabel("CAGR (%) within fold")
+    ax.set_title("Walk-Forward: Strategy vs. Nifty 50 CAGR per Chronological Fold\n(green = strategy beat Nifty 50 in that fold, red = did not)")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Saved plot: {path}")
+
+
+def plot_rolling_ic(roll: pd.DataFrame, window: int, path: str):
+    fig, ax1 = plt.subplots(figsize=(11, 6))
+    ax1.plot(roll.index, roll["mean_ic"], color="#457b9d", linewidth=1.5, label="Rolling mean IC")
+    ax1.axhline(0, color="black", linewidth=0.8)
+    ax1.set_ylabel("Rolling mean IC (Spearman)", color="#457b9d")
+    ax1.set_xlabel("Date")
+
+    ax2 = ax1.twinx()
+    ax2.plot(roll.index, roll["t_stat"], color="#e76f51", linewidth=1.2, linestyle="--", label="Rolling t-stat")
+    ax2.axhline(2, color="#e76f51", linewidth=0.8, linestyle=":", alpha=0.7)
+    ax2.axhline(-2, color="#e76f51", linewidth=0.8, linestyle=":", alpha=0.7)
+    ax2.set_ylabel("Rolling t-stat", color="#e76f51")
+
+    ax1.set_title(f"Total_Rank: {window}-quarter Rolling IC and t-stat Over Time\n(dotted lines mark |t|=2)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Saved plot: {path}")
+
+
+def main(n_folds=5, rolling_window=12):
+    panels = m.load_and_clean()
+    rebalance_weights, factor_snapshots = m.compute_signal(panels)
+
+    benchmark_series = m.get_benchmark_series()
+    benchmark_start = benchmark_series.dropna().index.min()
+
+    all_dates = panels["Close"].index
+    warmup = max(config.MOMENTUM_SKIP + config.MOMENTUM_WINDOW, config.VOLATILITY_WINDOW, config.VOLUME_SLOW) + 5
+    usable_dates = all_dates[warmup:]
+    usable_dates = usable_dates[usable_dates >= benchmark_start]
+
+    full_daily_weights = backtest.daily_target_weights(rebalance_weights, usable_dates)
+
+    print(f"\n================ WALK-FORWARD: {n_folds} CHRONOLOGICAL FOLDS ================\n")
+    folds = chronological_folds(usable_dates, n_folds)
+    fold_rows = []
+    for i, fold_dates in enumerate(folds, 1):
+        row = run_fold(panels, full_daily_weights, benchmark_series, fold_dates, f"Fold {i}")
+        fold_rows.append(row)
+        verdict = "BEAT" if row["beat_nifty"] else "trailed"
+        print(f"  Fold {i} ({row['start']} to {row['end']}): "
+              f"strategy CAGR {row['strategy_cagr_pct']:6.2f}% / Sharpe {row['strategy_sharpe']:5.2f}  "
+              f"vs Nifty CAGR {row['nifty_cagr_pct']:6.2f}% / Sharpe {row['nifty_sharpe']:5.2f}  -> {verdict}")
+
+    fold_df = pd.DataFrame(fold_rows)
+    fold_df.to_csv(f"{OUT_DIR}/walk_forward_folds.csv", index=False)
+    print(f"\nSaved: {OUT_DIR}/walk_forward_folds.csv")
+    plot_folds(fold_df, f"{OUT_DIR}/walk_forward_folds.png")
+
+    n_beat = fold_df["beat_nifty"].sum()
+    print(f"\nStrategy beat Nifty 50 in {n_beat}/{n_folds} independent chronological folds.")
+
+    print(f"\n================ ROLLING IC ({rolling_window}-QUARTER WINDOW) ================\n")
+    total_rank_snapshot = factor_snapshots["Total_Rank"]
+    total_rank_windowed = total_rank_snapshot[(total_rank_snapshot.index >= usable_dates[0]) &
+                                               (total_rank_snapshot.index <= usable_dates[-1])]
+    fwd_ret = ic_analysis.forward_returns(panels["Close"], total_rank_windowed.index)
+    ic_series = ic_analysis.compute_ic_series(total_rank_windowed, fwd_ret)
+
+    if len(ic_series) <= rolling_window:
+        print(f"  Not enough rebalance periods ({len(ic_series)}) for a {rolling_window}-period rolling window; skipping.")
+    else:
+        roll = rolling_ic(ic_series, rolling_window)
+        roll.to_csv(f"{OUT_DIR}/walk_forward_rolling_ic.csv")
+        print(f"Saved: {OUT_DIR}/walk_forward_rolling_ic.csv")
+        plot_rolling_ic(roll, rolling_window, f"{OUT_DIR}/walk_forward_rolling_ic.png")
+
+        frac_positive = (roll["mean_ic"] > 0).mean() * 100
+        frac_significant = (roll["t_stat"].abs() > 2).mean() * 100
+        print(f"\nRolling mean IC was positive in {frac_positive:.0f}% of the rolling windows.")
+        print(f"Rolling t-stat exceeded |t|=2 in {frac_significant:.0f}% of the rolling windows.")
+
+    return fold_df
+
+
+if __name__ == "__main__":
+    main()
