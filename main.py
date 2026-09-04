@@ -154,6 +154,26 @@ def main():
     # (yfinance's ^NSEI history starts well after some of the older stocks').
     usable_dates = usable_dates[usable_dates >= benchmark_start]
 
+    # Bug found via audit: `warmup` above is an offset into the FULL panel
+    # (which starts in the 1990s for old constituents like HDFCBANK), but
+    # idiosyncratic vol/beta need BETA_WINDOW=252 days of the BENCHMARK's
+    # OWN history, and the Nifty 50 series itself only starts at
+    # benchmark_start (2007-09-17) -- so Total_Rank was actually NaN for
+    # every stock until ~252 trading days AFTER benchmark_start (~2008-09),
+    # not from benchmark_start itself. That left a full extra year
+    # (2007-09-17 to 2008-09-30, confirmed via Total_Rank coverage: 0 valid
+    # stocks at every quarter-end in that window) where the strategy sat in
+    # 100% cash while being reported as part of the "Full Period" -- not a
+    # look-ahead or execution bug (the backtest correctly held cash when the
+    # signal was genuinely all-NaN), but a misleading start date that
+    # understated the strategy's true active-period return. Cap the start
+    # at the first date Total_Rank actually has TOP_N valid candidates.
+    min_rank_coverage_start = dp.first_date_with_min_coverage(factor_snapshots["Total_Rank"], config.TOP_N)
+    print(f"  Total_Rank has >= {config.TOP_N} valid candidates from {min_rank_coverage_start.date()} "
+          f"onward -- backtest will not start earlier than this either (idiosyncratic vol needs "
+          f"{config.BETA_WINDOW} days of the benchmark's OWN history, not just the universe's).")
+    usable_dates = usable_dates[usable_dates >= min_rank_coverage_start]
+
     train, val, test = dp.split_dates(usable_dates)
 
     print("\n================ FACTOR IC ANALYSIS ================\n")

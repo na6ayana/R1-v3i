@@ -145,6 +145,16 @@ def main():
     usable_dates = usable_dates[usable_dates >= benchmark_start]
     usable_dates = usable_dates[usable_dates >= min_coverage_start]
 
+    # Same bug found and fixed on the Indian side: idiosyncratic vol/beta
+    # need BETA_WINDOW days of the BENCHMARK's own history, which can bind
+    # later than the universe-coverage gate above. Belt-and-suspenders --
+    # ^NDX has data back to 1985 so this doesn't end up binding here (the
+    # coverage gate above is already later), but check explicitly rather
+    # than assume.
+    min_rank_coverage_start = dp.first_date_with_min_coverage(factor_snapshots["Total_Rank"], config.TOP_N)
+    print(f"  Total_Rank has >= {config.TOP_N} valid candidates from {min_rank_coverage_start.date()} onward.")
+    usable_dates = usable_dates[usable_dates >= min_rank_coverage_start]
+
     train, val, test = dp.split_dates(usable_dates)
 
     print("\n================ FACTOR IC ANALYSIS (NASDAQ-100) ================\n")

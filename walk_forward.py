@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 
 import config
+import data_pipeline as dp
 import backtest
 import metrics
 import ic_analysis
@@ -143,6 +144,12 @@ def main(n_folds=5, rolling_window=12):
     warmup = max(config.MOMENTUM_SKIP + config.MOMENTUM_WINDOW, config.BETA_WINDOW, config.VOLUME_SLOW) + 5
     usable_dates = all_dates[warmup:]
     usable_dates = usable_dates[usable_dates >= benchmark_start]
+    # See main.py's matching comment: idiosyncratic vol/beta need
+    # BETA_WINDOW days of the BENCHMARK's own history, which binds later
+    # than benchmark_start alone for India (Total_Rank was all-NaN until
+    # ~2008-09, a full year after benchmark_start).
+    min_rank_coverage_start = dp.first_date_with_min_coverage(factor_snapshots["Total_Rank"], config.TOP_N)
+    usable_dates = usable_dates[usable_dates >= min_rank_coverage_start]
 
     full_daily_weights = backtest.daily_target_weights(rebalance_weights, usable_dates)
     adtv_px = liquidity.average_daily_traded_value(panels["Close"], panels["Volume"])

@@ -127,6 +127,8 @@ def main(n_folds=5, rolling_window=12):
     usable_dates = all_dates[warmup:]
     usable_dates = usable_dates[usable_dates >= benchmark_start]
     usable_dates = usable_dates[usable_dates >= min_coverage_start]
+    min_rank_coverage_start = dp.first_date_with_min_coverage(factor_snapshots["Total_Rank"], config.TOP_N)
+    usable_dates = usable_dates[usable_dates >= min_rank_coverage_start]
 
     full_daily_weights = backtest.daily_target_weights(rebalance_weights, usable_dates)
     adtv_px = liquidity.average_daily_traded_value(panels["Close"], panels["Volume"])
