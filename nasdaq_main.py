@@ -1,10 +1,17 @@
-"""Run the ranked-asset-allocation backtest end to end."""
+"""Run the ranked-allocation strategy end to end on Nasdaq-100 stocks.
+
+A direct port of main.py's pipeline onto nasdaq_config's universe/costs/
+benchmark -- same factors.py/backtest.py/metrics.py/ic_analysis.py/
+liquidity.py engine, same strategy parameters (see nasdaq_config.py's
+docstring: this tests whether the design travels, it does not re-tune it
+for the US market).
+"""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
-import config
+import nasdaq_config as config
 import data_pipeline as dp
 import factors
 import backtest
@@ -12,41 +19,36 @@ import metrics
 import ic_analysis
 import liquidity
 
-OUT_DIR = "output"
+OUT_DIR = "output_nasdaq"
 
 
 def load_and_clean():
-    print("Downloading universe data from yfinance...")
-    raw = dp.download_universe(config.UNIVERSE)
-    print("Cleaning: dropping Muhurat-trading days, winsorizing return tails...")
-    cleaned = dp.clean_data(raw)
+    print("Downloading Nasdaq-100 universe data from yfinance...")
+    raw = dp.download_universe(config.UNIVERSE, cache_dir=config.CACHE_DIR)
+    print("Cleaning: winsorizing return tails (no Muhurat-day equivalent for US markets)...")
+    cleaned = dp.clean_data(raw, muhurat_dates=config.MUHURAT_TRADING_DATES,
+                             winsor_abs_cap=config.WINSOR_ABS_RETURN_CAP)
     panels = dp.build_price_panels(cleaned)
     return panels
 
 
 def compute_signal(panels, benchmark_series):
     print("Computing factors: Momentum, Idiosyncratic Volatility, Volume Confirmation...")
-    m = factors.momentum(panels["Close"])
-    # Idiosyncratic volatility (Ang-Hodrick-Xing-Zhang), direction FLIPPED
-    # vs. the academic finding: their result is low idio-vol -> higher
-    # returns, but IC-tested on this universe it came out strongly the
-    # other way (t=-3.08 on the standard "favor low" ranking). Negating the
-    # factor before it goes into cross_sectional_ranks (which always favors
-    # low values for the "v" slot) flips the ranking to favor HIGH
-    # idiosyncratic volatility instead, matching what the data actually
-    # showed here rather than the textbook direction.
-    v = -factors.idiosyncratic_volatility(panels["Close"], benchmark_series)
-    vc = factors.volume_confirmation(panels["Close"], panels["Volume"])
+    m = factors.momentum(panels["Close"], window=config.MOMENTUM_WINDOW, skip=config.MOMENTUM_SKIP)
+    # Same sign-flip as the Indian pipeline (favor HIGH idiosyncratic vol,
+    # not low) -- ported as-is; NOT re-validated by a fresh IC test on this
+    # market before being applied. That re-validation is exactly what
+    # running this module and reading its own IC table is for.
+    v = -factors.idiosyncratic_volatility(panels["Close"], benchmark_series, window=config.BETA_WINDOW)
+    vc = factors.volume_confirmation(panels["Close"], panels["Volume"],
+                                      fast=config.VOLUME_FAST, slow=config.VOLUME_SLOW)
 
-    total_rank_d = factors.total_rank_daily(m, v, vc)
-    rebalance_rank = factors.resample_total_rank(total_rank_d)
-    rebalance_membership = factors.hysteresis_membership(rebalance_rank)
+    total_rank_d = factors.total_rank_daily(m, v, vc, w1=config.W1, w2=config.W2, w3=config.W3, x=config.X)
+    rebalance_rank = factors.resample_total_rank(total_rank_d, freq=config.REBALANCE_FREQ)
+    rebalance_membership = factors.hysteresis_membership(rebalance_rank, top_n=config.TOP_N,
+                                                           buffer=config.HYSTERESIS_BUFFER)
     rebalance_weights = backtest.build_signal_weights(rebalance_membership)
 
-    # Rebalance-period snapshots of each sub-rank, for IC analysis -- same
-    # construction/cadence as Total_Rank, so "does this sub-factor's rank
-    # predict the NEXT rebalance period's return" can be checked individually
-    # and against the combined score.
     rank_m, rank_v, rank_vc = factors.cross_sectional_ranks(m, v, vc)
     factor_snapshots = {
         "Rank_M": rank_m.resample(config.REBALANCE_FREQ).last(),
@@ -61,31 +63,21 @@ def run_period(panels, full_daily_weights, adtv_px, dates, label):
     close_px = panels["Close"].loc[dates]
     open_px = panels["Open"].loc[dates]
     adtv_slice = adtv_px.loc[dates]
-    # Slice the ALREADY ffill+shifted full-history weight frame, rather than
-    # recomputing ffill+shift on just this period's dates -- recomputing on a
-    # sub-slice would wipe out row 0's true (carried-over) signal via shift(1)
-    # and force a spurious cash reset at the start of Validation/Test.
     daily_w = full_daily_weights.loc[dates]
-    result = backtest.run_backtest(open_px, close_px, daily_w, adtv_px=adtv_slice)
-    s = metrics.summary(result["nav"], label)
+    result = backtest.run_backtest(open_px, close_px, daily_w, adtv_px=adtv_slice,
+                                    initial_capital=config.INITIAL_CAPITAL,
+                                    cost_config=config.COSTS, fy_start_month=config.FY_START_MONTH)
+    s = metrics.summary(result["nav"], label, rf_annual=config.RF_ANNUAL)
     metrics.print_summary(s)
     return result, s
 
 
 def get_benchmark_series(ticker=None):
-    """Fetch a benchmark's full history and run it through the SAME cleaning
-    pipeline (Muhurat-day drop, winsorization) as the strategy universe --
-    a raw yf.download is vulnerable to the same vendor data glitches found
-    in the strategy data (e.g. GOLDBEES.NS's 2019-12-19/20 ~99% single-day
-    move was a known Yahoo Finance data bug, not a real price move)."""
     ticker = ticker or config.BENCHMARK
-    raw = dp.download_universe([ticker])
-    cleaned = dp.clean_data(raw)
+    raw = dp.download_universe([ticker], cache_dir=config.CACHE_DIR)
+    cleaned = dp.clean_data(raw, muhurat_dates=config.MUHURAT_TRADING_DATES,
+                             winsor_abs_cap=config.WINSOR_ABS_RETURN_CAP)
     return cleaned[ticker]["Close"]
-
-
-def get_benchmark(dates, ticker=None):
-    return get_benchmark_series(ticker).reindex(dates).ffill()
 
 
 def plot_cumulative(strategy_nav: pd.Series, benchmark_close: pd.Series, benchmark_label: str,
@@ -108,8 +100,6 @@ def plot_cumulative(strategy_nav: pd.Series, benchmark_close: pd.Series, benchma
 
 
 def plot_ic_summary(ic_summary: pd.DataFrame, path: str):
-    """Bar chart of mean monthly IC per factor, annotated with its t-stat.
-    A dashed line at |t|=2 marks the conventional "significant" threshold."""
     fig, ax = plt.subplots(figsize=(9, 5.5))
     factors_ = ic_summary.index.tolist()
     means = ic_summary["mean_ic"].values
@@ -122,8 +112,8 @@ def plot_ic_summary(ic_summary: pd.DataFrame, path: str):
         ax.text(bar.get_x() + bar.get_width() / 2, y + offset,
                 f"t={row['t_stat']:.2f}", ha="center", va=va, fontsize=9)
     ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_ylabel("Mean monthly IC (Spearman)")
-    ax.set_title("Factor IC Summary (mean IC, annotated with t-stat)")
+    ax.set_ylabel("Mean quarterly IC (Spearman)")
+    ax.set_title("Nasdaq-100 Factor IC Summary (mean IC, annotated with t-stat)")
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -137,26 +127,27 @@ def main():
 
     panels = load_and_clean()
 
-    print("\nDetermining benchmark (Nifty 50) start date to cap the backtest window...")
+    print("\nDetermining benchmark (Nasdaq-100 index) start date to cap the backtest window...")
     benchmark_series = get_benchmark_series()
     benchmark_start = benchmark_series.dropna().index.min()
-    print(f"  Nifty 50 data starts {benchmark_start.date()} -- backtest will not start earlier than this.")
+    print(f"  {config.BENCHMARK} data starts {benchmark_start.date()} -- backtest will not start earlier than this.")
 
     rebalance_weights, factor_snapshots = compute_signal(panels, benchmark_series)
 
+    min_coverage_start = dp.first_date_with_min_coverage(panels["Close"], config.MIN_UNIVERSE_SIZE)
+    print(f"  At least {config.MIN_UNIVERSE_SIZE}/{len(config.UNIVERSE)} current constituents have data "
+          f"from {min_coverage_start.date()} onward -- backtest will not start earlier than this either "
+          f"(most of today's Nasdaq-100 didn't exist before the mid-1990s).")
+
     all_dates = panels["Close"].index
-    # warm up: need MOMENTUM_SKIP+MOMENTUM_WINDOW / BETA_WINDOW / VOLUME_SLOW
-    # history before factors are valid (idiosyncratic vol needs BETA_WINDOW=252
-    # days, longer than the old VOLATILITY_WINDOW=10 it replaced).
     warmup = max(config.MOMENTUM_SKIP + config.MOMENTUM_WINDOW, config.BETA_WINDOW, config.VOLUME_SLOW) + 5
     usable_dates = all_dates[warmup:]
-    # Cap the start so every period actually has a benchmark to compare against
-    # (yfinance's ^NSEI history starts well after some of the older stocks').
     usable_dates = usable_dates[usable_dates >= benchmark_start]
+    usable_dates = usable_dates[usable_dates >= min_coverage_start]
 
     train, val, test = dp.split_dates(usable_dates)
 
-    print("\n================ FACTOR IC ANALYSIS ================\n")
+    print("\n================ FACTOR IC ANALYSIS (NASDAQ-100) ================\n")
     print(f"Cross-sectional Spearman rank-IC ({config.REBALANCE_FREQ} rebalance cadence) between")
     print("each factor's rank at a rebalance date and the asset's forward return to the")
     print(f"NEXT rebalance date, restricted to the same window as the backtest")
@@ -171,16 +162,10 @@ def main():
     print(f"\nSaved IC table: {OUT_DIR}/ic_analysis.csv")
     plot_ic_summary(ic_summary, f"{OUT_DIR}/ic_summary.png")
 
-    # Build the full-history daily weight signal ONCE (ffill + one-day shift
-    # over the entire usable calendar) so period slices below inherit
-    # whatever signal was genuinely live at their start, instead of each
-    # slice re-deriving its own (incorrect) cold start.
     full_daily_weights = backtest.daily_target_weights(rebalance_weights, usable_dates)
-
-    # Trailing ADTV per asset, for slippage sizing (see liquidity.py).
     adtv_px = liquidity.average_daily_traded_value(panels["Close"], panels["Volume"])
 
-    print("\n================ BACKTEST RESULTS ================\n")
+    print("\n================ BACKTEST RESULTS (NASDAQ-100) ================\n")
     results = {}
     summaries = []
     for label, dates in [("Train (60%)", train), ("Validation (20%)", val), ("Test (20%)", test), ("Full Period", usable_dates)]:
@@ -197,29 +182,20 @@ def main():
     full_result.to_csv(f"{OUT_DIR}/daily_nav_full_period.csv")
 
     bm_close = benchmark_series.reindex(full_result.index).ffill()
-    plot_cumulative(full_result["nav"], bm_close, "Nifty 50",
+    plot_cumulative(full_result["nav"], bm_close, "Nasdaq-100",
                      f"{OUT_DIR}/cumulative_returns.png",
-                     "Cumulative Returns: Strategy vs. Nifty 50")
+                     "Cumulative Returns: Strategy vs. Nasdaq-100")
 
-    bm_summary = metrics.summary(bm_close.dropna(), "Nifty 50 Benchmark (Full Period)")
+    bm_summary = metrics.summary(bm_close.dropna(), "Nasdaq-100 Benchmark (Full Period)", rf_annual=config.RF_ANNUAL)
     metrics.print_summary(bm_summary)
     pd.DataFrame([bm_summary]).set_index("period").to_csv(f"{OUT_DIR}/benchmark_summary.csv")
-
-    print("\nDownloading GOLDBEES.NS for comparison (not part of the stock universe)...")
-    gold_close = get_benchmark(full_result.index, ticker="GOLDBEES.NS")
-    plot_cumulative(full_result["nav"], gold_close, "GOLDBEES.NS",
-                     f"{OUT_DIR}/cumulative_returns_vs_goldbees.png",
-                     "Cumulative Returns: Strategy vs. GOLDBEES.NS")
-    gold_summary = metrics.summary(gold_close.dropna(), "GOLDBEES.NS (Full Period)")
-    metrics.print_summary(gold_summary)
-    pd.DataFrame([gold_summary]).set_index("period").to_csv(f"{OUT_DIR}/goldbees_summary.csv")
 
     total_costs = full_result["cost"].sum()
     total_slippage = full_result["slippage"].sum()
     total_taxes = full_result["tax"].sum()
-    print(f"\nTotal transaction costs over full period: INR {total_costs:,.0f}")
-    print(f"Total slippage (market impact) over full period: INR {total_slippage:,.0f}")
-    print(f"Total capital-gains tax over full period : INR {total_taxes:,.0f}")
+    print(f"\nTotal transaction costs over full period: USD {total_costs:,.0f}")
+    print(f"Total slippage (market impact) over full period: USD {total_slippage:,.0f}")
+    print(f"Total capital-gains tax over full period : USD {total_taxes:,.0f}")
 
 
 if __name__ == "__main__":

@@ -75,6 +75,90 @@ def downside_deviation(close: pd.DataFrame, window=config.VOLATILITY_WINDOW, ann
     return dd
 
 
+def _market_returns_aligned(market_close: pd.Series, index: pd.DatetimeIndex) -> pd.Series:
+    """Reindex the market benchmark onto `index` and forward-fill BEFORE
+    taking returns, not after.
+
+    Sparse single-day mismatches are common (a handful of days where a
+    stock traded but the index didn't publish a value, or vice versa --
+    found ~26 such days over 2007-2026 in Nifty 50 vs. this universe's
+    trading calendar). A plain reindex leaves those as NaN, and a single
+    NaN anywhere inside a `window`-day rolling calculation (beta needs
+    ~252 days) blanks out the ENTIRE window, not just that one day --
+    turning a handful of sparse gaps into years of missing beta values.
+    Forward-filling first (carrying the last known index level forward,
+    the same treatment already used for every other benchmark alignment
+    in this codebase) fixes it at the source.
+    """
+    return market_close.reindex(index).ffill().pct_change(fill_method=None)
+
+
+def beta_to_market(close: pd.DataFrame, market_close: pd.Series, window=config.BETA_WINDOW) -> pd.DataFrame:
+    """Rolling CAPM beta of each stock's daily returns against the market
+    (Nifty 50) benchmark's daily returns, over `window` trading days.
+
+    Frazzini & Pedersen (2014, "Betting Against Beta", JFE) find low-beta
+    stocks earn higher risk-adjusted returns than CAPM predicts -- the
+    security market line is empirically "too flat." Their implementation
+    isolates this as a pure risk premium via a leveraged, beta-neutral
+    long-short portfolio, which needs short selling -- not usable in this
+    long-only, delivery-based Indian equity strategy. The underlying
+    cross-sectional finding doesn't need the short leg though: ranking
+    stocks by beta and favoring the low end is a long-only tilt, exactly how
+    every other factor here already works (this is what real long-only
+    "low volatility" funds do in practice, e.g. ICICI Pru Nifty Low Vol 30).
+
+    Computed via the covariance/variance identity (fully vectorized, no
+    per-column rolling regression loop): beta = Cov(r_i, r_m) / Var(r_m),
+    with Cov/Var expanded as E[XY] - E[X]E[Y] so everything is a plain
+    rolling mean.
+    """
+    stock_ret = close.pct_change(fill_method=None)
+    mkt_ret = _market_returns_aligned(market_close, close.index)
+
+    mean_i = stock_ret.rolling(window).mean()
+    mean_m = mkt_ret.rolling(window).mean()
+    mean_im = stock_ret.multiply(mkt_ret, axis=0).rolling(window).mean()
+    cov_im = mean_im - mean_i.multiply(mean_m, axis=0)
+
+    var_m = (mkt_ret ** 2).rolling(window).mean() - mean_m ** 2
+
+    return cov_im.div(var_m, axis=0)
+
+
+def idiosyncratic_volatility(close: pd.DataFrame, market_close: pd.Series,
+                              window=config.BETA_WINDOW, annualize=True) -> pd.DataFrame:
+    """Volatility of each stock's return NOT explained by its market-beta
+    exposure, rolling over `window` days.
+
+    Ang, Hodrick, Xing & Zhang (2006, "The Cross-Section of Volatility and
+    Expected Returns", Journal of Finance) find stocks with high
+    idiosyncratic (stock-specific, non-market) volatility earn LOWER future
+    returns -- a distinct anomaly from beta itself, and from the total
+    volatility / downside deviation already used elsewhere in this file.
+    A stock can have high total volatility purely because it has high beta
+    (moves a lot because the market moves a lot) without necessarily having
+    high idiosyncratic risk; this isolates the stock-specific part.
+
+    Uses the CAPM variance decomposition Var(r_i) = beta^2 * Var(r_m) +
+    Var(idiosyncratic), rather than a rolling regression-residual series
+    (equivalent under CAPM assumptions, far cheaper to compute across many
+    assets and a long history).
+    """
+    stock_ret = close.pct_change(fill_method=None)
+    mkt_ret = _market_returns_aligned(market_close, close.index)
+
+    b = beta_to_market(close, market_close, window)
+    var_i = stock_ret.rolling(window).var(ddof=1)
+    var_m = mkt_ret.rolling(window).var(ddof=1)
+
+    idio_var = (var_i - (b ** 2).multiply(var_m, axis=0)).clip(lower=0)
+    idio_vol = np.sqrt(idio_var)
+    if annualize:
+        idio_vol = idio_vol * np.sqrt(252)
+    return idio_vol
+
+
 def volume_confirmation(close: pd.DataFrame, volume: pd.DataFrame,
                          fast=config.VOLUME_FAST, slow=config.VOLUME_SLOW) -> pd.DataFrame:
     """Price-aware volume confirmation: is buying pressure accelerating?
@@ -118,9 +202,21 @@ def volume_confirmation(close: pd.DataFrame, volume: pd.DataFrame,
 def cross_sectional_ranks(m: pd.DataFrame, v: pd.DataFrame, vc: pd.DataFrame):
     """Rank each factor cross-sectionally (across assets) on each date.
 
-    - Rank_of_M: highest momentum -> highest numeric rank (ascending value order)
-    - Rank_of_V: lowest volatility -> highest numeric rank (descending value order)
-    - Rank_of_VC: highest volume confirmation -> highest numeric rank (ascending value order)
+    - Rank_of_M: highest `m` value -> highest numeric rank
+    - Rank_of_V: LOWEST `v` value -> highest numeric rank
+    - Rank_of_VC: LOWEST `vc` value -> highest numeric rank
+
+    These describe the ranking MECHANISM, not a fixed economic meaning --
+    the caller decides what "favored" means for the "v" and "vc" slots by
+    choosing what to pass in (negating a factor before it gets here flips
+    which end of it is favored). As of this writing main.py passes
+    `v = -idiosyncratic_volatility(...)` (so this ends up favoring HIGH
+    idiosyncratic volatility, not low -- direction flipped vs. the Ang-
+    Hodrick-Xing-Zhang academic finding, based on IC evidence on this
+    universe) and `vc = volume_confirmation(...)` unchanged (favoring LOW
+    volume-confirmation, also flipped vs. that factor's original intent).
+    Check main.py's compute_signal for what's actually plugged in before
+    assuming either slot's direction.
     """
     rank_m = m.rank(axis=1, ascending=True, method="average")
     rank_v = v.rank(axis=1, ascending=False, method="average")
@@ -128,9 +224,14 @@ def cross_sectional_ranks(m: pd.DataFrame, v: pd.DataFrame, vc: pd.DataFrame):
     return rank_m, rank_v, rank_vc
 
 
-def total_rank_daily(m: pd.DataFrame, v: pd.DataFrame, vc: pd.DataFrame) -> pd.DataFrame:
+def total_rank_daily(m: pd.DataFrame, v: pd.DataFrame, vc: pd.DataFrame,
+                      w1=None, w2=None, w3=None, x=None) -> pd.DataFrame:
+    w1 = config.W1 if w1 is None else w1
+    w2 = config.W2 if w2 is None else w2
+    w3 = config.W3 if w3 is None else w3
+    x = config.X if x is None else x
     rank_m, rank_v, rank_vc = cross_sectional_ranks(m, v, vc)
-    total = config.W1 * rank_m + config.W2 * rank_v + config.W3 * rank_vc + m / config.X
+    total = w1 * rank_m + w2 * rank_v + w3 * rank_vc + m / x
     return total
 
 

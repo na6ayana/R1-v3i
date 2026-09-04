@@ -1,33 +1,11 @@
-"""Walk-forward / out-of-sample robustness check for the ranked allocation
-strategy.
+"""Walk-forward / out-of-sample robustness check for the Nasdaq-100 module.
 
-What this does and does NOT test
----------------------------------
-The strategy's DAILY TRADING DECISIONS are already causal / lookahead-free
-(factors use only trailing data, signals are shifted by one trading day
-before being acted on -- see backtest.py). What is NOT causal is the
-strategy's DESIGN: the choice of 12-1 momentum, downside deviation, the
-price-aware volume factor, quarterly rebalancing, and the hysteresis buffer
-were all arrived at by iterating and looking at full-period results. That is
-the actual overfitting exposure -- not lookahead bias in execution, but
-hindsight in strategy selection.
-
-This module does NOT attempt to reproduce that design process fold-by-fold
-(that would require an automated factor-search framework standing in for
-what was really a theory-driven, human-guided process -- not a faithful
-simulation of it). What it DOES check, honestly:
-
-1. **Sequential fold backtest**: split the full history into N chronological,
-   non-overlapping chunks and run an INDEPENDENT backtest on each (fresh
-   capital every fold) using the CURRENT, FROZEN configuration. If the
-   strategy's edge is concentrated in one or two chunks and roughly flat or
-   negative in the others, that's a strong overfitting/regime-luck signal.
-   If it's positive and beats its own chunk's Nifty 50 return in most/all
-   folds, that's real (if not conclusive) evidence of a persistent effect.
-
-2. **Rolling IC**: a trailing-window view of Total_Rank's Spearman IC over
-   time, to see whether the factor's predictive power has been persistent,
-   decaying, or concentrated in a specific stretch of history.
+Direct port of walk_forward.py's methodology onto nasdaq_main/nasdaq_config
+-- see that file's docstring for what this does and does not test (same
+caveats apply: daily execution is causal, but the strategy DESIGN was
+arrived at by iterating on Indian data, then ported here unchanged. This
+walk-forward tests whether the ported design holds up out-of-sample on
+THIS market, not whether the original design process was sound).
 """
 import matplotlib
 matplotlib.use("Agg")
@@ -35,18 +13,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import config
+import nasdaq_config as config
+import data_pipeline as dp
 import backtest
 import metrics
 import ic_analysis
 import liquidity
-import main as m
+import nasdaq_main as m
 
-OUT_DIR = "output"
+OUT_DIR = m.OUT_DIR
 
 
 def chronological_folds(dates: pd.DatetimeIndex, n_folds: int):
-    """Split `dates` into n_folds contiguous, roughly-equal chunks, in order."""
     edges = np.linspace(0, len(dates), n_folds + 1, dtype=int)
     return [dates[edges[i]:edges[i + 1]] for i in range(n_folds)]
 
@@ -56,12 +34,14 @@ def run_fold(panels, full_daily_weights, adtv_px, benchmark_series, fold_dates, 
     open_px = panels["Open"].loc[fold_dates]
     daily_w = full_daily_weights.loc[fold_dates]
     adtv_slice = adtv_px.loc[fold_dates]
-    result = backtest.run_backtest(open_px, close_px, daily_w, adtv_px=adtv_slice)
-    s = metrics.summary(result["nav"], label)
+    result = backtest.run_backtest(open_px, close_px, daily_w, adtv_px=adtv_slice,
+                                    initial_capital=config.INITIAL_CAPITAL,
+                                    cost_config=config.COSTS, fy_start_month=config.FY_START_MONTH)
+    s = metrics.summary(result["nav"], label, rf_annual=config.RF_ANNUAL)
 
     bm_seg = benchmark_series.reindex(fold_dates).ffill().dropna()
     bm_cagr = metrics.cagr(bm_seg) * 100 if len(bm_seg) > 1 else float("nan")
-    bm_sharpe = metrics.sharpe_ratio(metrics.daily_returns(bm_seg)) if len(bm_seg) > 1 else float("nan")
+    bm_sharpe = metrics.sharpe_ratio(metrics.daily_returns(bm_seg), config.RF_ANNUAL) if len(bm_seg) > 1 else float("nan")
 
     return {
         "fold": label,
@@ -70,15 +50,13 @@ def run_fold(panels, full_daily_weights, adtv_px, benchmark_series, fold_dates, 
         "strategy_cagr_pct": s["cagr_pct"],
         "strategy_sharpe": s["sharpe"],
         "strategy_maxdd_pct": s["max_drawdown_pct"],
-        "nifty_cagr_pct": bm_cagr,
-        "nifty_sharpe": bm_sharpe,
-        "beat_nifty": s["cagr_pct"] > bm_cagr,
+        "bench_cagr_pct": bm_cagr,
+        "bench_sharpe": bm_sharpe,
+        "beat_bench": s["cagr_pct"] > bm_cagr,
     }
 
 
 def rolling_ic(ic_series: pd.Series, window: int):
-    """Trailing-window mean IC and t-stat, one point per rebalance date once
-    `window` prior observations are available."""
     out = {}
     for i in range(window, len(ic_series) + 1):
         chunk = ic_series.iloc[i - window:i]
@@ -94,15 +72,15 @@ def plot_folds(fold_df: pd.DataFrame, path: str):
     fig, ax = plt.subplots(figsize=(11, 6))
     x = np.arange(len(fold_df))
     width = 0.35
-    colors_strat = ["#2a9d8f" if b else "#e76f51" for b in fold_df["beat_nifty"]]
+    colors_strat = ["#2a9d8f" if b else "#e76f51" for b in fold_df["beat_bench"]]
     ax.bar(x - width / 2, fold_df["strategy_cagr_pct"], width, color=colors_strat, label="Strategy")
-    ax.bar(x + width / 2, fold_df["nifty_cagr_pct"], width, color="#888888", label="Nifty 50")
+    ax.bar(x + width / 2, fold_df["bench_cagr_pct"], width, color="#888888", label="Nasdaq-100")
     ax.set_xticks(x)
     ax.set_xticklabels([f"{row['fold']}\n{row['start']} to {row['end']}" for _, row in fold_df.iterrows()],
                         fontsize=8)
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_ylabel("CAGR (%) within fold")
-    ax.set_title("Walk-Forward: Strategy vs. Nifty 50 CAGR per Chronological Fold\n(green = strategy beat Nifty 50 in that fold, red = did not)")
+    ax.set_title("Walk-Forward: Strategy vs. Nasdaq-100 CAGR per Chronological Fold\n(green = strategy beat Nasdaq-100 in that fold, red = did not)")
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
@@ -124,7 +102,7 @@ def plot_rolling_ic(roll: pd.DataFrame, window: int, path: str):
     ax2.axhline(-2, color="#e76f51", linewidth=0.8, linestyle=":", alpha=0.7)
     ax2.set_ylabel("Rolling t-stat", color="#e76f51")
 
-    ax1.set_title(f"Total_Rank: {window}-quarter Rolling IC and t-stat Over Time\n(dotted lines mark |t|=2)")
+    ax1.set_title(f"Nasdaq-100 Total_Rank: {window}-quarter Rolling IC and t-stat Over Time\n(dotted lines mark |t|=2)")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -132,6 +110,9 @@ def plot_rolling_ic(roll: pd.DataFrame, window: int, path: str):
 
 
 def main(n_folds=5, rolling_window=12):
+    import os
+    os.makedirs(OUT_DIR, exist_ok=True)
+
     panels = m.load_and_clean()
 
     benchmark_series = m.get_benchmark_series()
@@ -139,32 +120,35 @@ def main(n_folds=5, rolling_window=12):
 
     rebalance_weights, factor_snapshots = m.compute_signal(panels, benchmark_series)
 
+    min_coverage_start = dp.first_date_with_min_coverage(panels["Close"], config.MIN_UNIVERSE_SIZE)
+
     all_dates = panels["Close"].index
     warmup = max(config.MOMENTUM_SKIP + config.MOMENTUM_WINDOW, config.BETA_WINDOW, config.VOLUME_SLOW) + 5
     usable_dates = all_dates[warmup:]
     usable_dates = usable_dates[usable_dates >= benchmark_start]
+    usable_dates = usable_dates[usable_dates >= min_coverage_start]
 
     full_daily_weights = backtest.daily_target_weights(rebalance_weights, usable_dates)
     adtv_px = liquidity.average_daily_traded_value(panels["Close"], panels["Volume"])
 
-    print(f"\n================ WALK-FORWARD: {n_folds} CHRONOLOGICAL FOLDS ================\n")
+    print(f"\n================ WALK-FORWARD (NASDAQ-100): {n_folds} CHRONOLOGICAL FOLDS ================\n")
     folds = chronological_folds(usable_dates, n_folds)
     fold_rows = []
     for i, fold_dates in enumerate(folds, 1):
         row = run_fold(panels, full_daily_weights, adtv_px, benchmark_series, fold_dates, f"Fold {i}")
         fold_rows.append(row)
-        verdict = "BEAT" if row["beat_nifty"] else "trailed"
+        verdict = "BEAT" if row["beat_bench"] else "trailed"
         print(f"  Fold {i} ({row['start']} to {row['end']}): "
               f"strategy CAGR {row['strategy_cagr_pct']:6.2f}% / Sharpe {row['strategy_sharpe']:5.2f}  "
-              f"vs Nifty CAGR {row['nifty_cagr_pct']:6.2f}% / Sharpe {row['nifty_sharpe']:5.2f}  -> {verdict}")
+              f"vs Nasdaq-100 CAGR {row['bench_cagr_pct']:6.2f}% / Sharpe {row['bench_sharpe']:5.2f}  -> {verdict}")
 
     fold_df = pd.DataFrame(fold_rows)
     fold_df.to_csv(f"{OUT_DIR}/walk_forward_folds.csv", index=False)
     print(f"\nSaved: {OUT_DIR}/walk_forward_folds.csv")
     plot_folds(fold_df, f"{OUT_DIR}/walk_forward_folds.png")
 
-    n_beat = fold_df["beat_nifty"].sum()
-    print(f"\nStrategy beat Nifty 50 in {n_beat}/{n_folds} independent chronological folds.")
+    n_beat = fold_df["beat_bench"].sum()
+    print(f"\nStrategy beat Nasdaq-100 in {n_beat}/{n_folds} independent chronological folds.")
 
     print(f"\n================ ROLLING IC ({rolling_window}-QUARTER WINDOW) ================\n")
     total_rank_snapshot = factor_snapshots["Total_Rank"]

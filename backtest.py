@@ -4,6 +4,7 @@ import pandas as pd
 
 import config
 import costs
+import liquidity
 
 
 def build_signal_weights(rebalance_membership: pd.DataFrame) -> pd.DataFrame:
@@ -22,12 +23,21 @@ def daily_target_weights(rebalance_weights: pd.DataFrame, daily_index: pd.Dateti
 
 
 def run_backtest(open_px: pd.DataFrame, close_px: pd.DataFrame, target_weights: pd.DataFrame,
-                  initial_capital=config.INITIAL_CAPITAL):
+                  adtv_px: pd.DataFrame = None, initial_capital=config.INITIAL_CAPITAL,
+                  cost_config: dict = None, fy_start_month: int = 4):
     """Event-driven simulation with share-count accounting.
 
     Rebalance trades execute at the day's Open price (the day after the
     signal date), valued against the portfolio's value at the prior close.
-    Returns a dict of daily series: nav, cash, turnover, costs, taxes.
+    `adtv_px` (trailing average daily traded value per asset, see
+    liquidity.average_daily_traded_value) sizes a square-root market-impact
+    slippage adjustment on top of the quoted Open price -- see liquidity.py.
+    Passing None disables slippage modeling (quoted price used as-is).
+    `cost_config`/`fy_start_month` let a different market's cost & tax-year
+    structure (e.g. nasdaq_config.COSTS, fy_start_month=1 for a calendar tax
+    year) reuse this same engine -- default None/4 keeps the Indian
+    (config.COSTS, Apr-Mar) behavior unchanged.
+    Returns a dict of daily series: nav, cash, turnover, costs, slippage, taxes.
     """
     dates = close_px.index
     assets = list(close_px.columns)
@@ -36,10 +46,12 @@ def run_backtest(open_px: pd.DataFrame, close_px: pd.DataFrame, target_weights: 
     shares = {a: 0.0 for a in assets}
     entry_price = {a: None for a in assets}
     entry_date = {a: None for a in assets}
+    last_valid_close = {a: None for a in assets}
     fy_ltcg_used = {}
 
     nav_hist = []
     cost_hist = []
+    slippage_hist = []
     tax_hist = []
     turnover_hist = []
     n_holdings_hist = []
@@ -49,6 +61,7 @@ def run_backtest(open_px: pd.DataFrame, close_px: pd.DataFrame, target_weights: 
 
     for i, d in enumerate(dates):
         day_cost = 0.0
+        day_slippage = 0.0
         day_tax = 0.0
         day_turnover = 0.0
 
@@ -66,6 +79,7 @@ def run_backtest(open_px: pd.DataFrame, close_px: pd.DataFrame, target_weights: 
 
         if is_rebalance_day:
             o_row = open_px.loc[d]
+            adtv_row = adtv_px.loc[d] if adtv_px is not None and d in adtv_px.index else None
             portfolio_value_for_sizing = prev_close_val
 
             # Only assets with a usable open price today can be traded today.
@@ -77,6 +91,10 @@ def run_backtest(open_px: pd.DataFrame, close_px: pd.DataFrame, target_weights: 
                 if pd.isna(px) or px <= 0:
                     continue  # asset not tradeable today (e.g. not yet listed) -> hold prior state (should be 0 anyway)
 
+                # Position SIZE is targeted against the quoted price (this is
+                # the price you observe when deciding how many shares to buy);
+                # slippage below affects the price you actually PAY/RECEIVE
+                # for that many shares, not how many shares you're aiming for.
                 target_value = portfolio_value_for_sizing * target_w
                 target_shares = target_value / px if px > 0 else 0.0
                 delta = target_shares - shares[a]
@@ -84,34 +102,42 @@ def run_backtest(open_px: pd.DataFrame, close_px: pd.DataFrame, target_weights: 
                 if abs(delta) < 1e-9:
                     continue
 
-                trade_value = abs(delta) * px
-                day_turnover += trade_value
+                trade_value_quoted = abs(delta) * px
+                adtv = adtv_row.get(a, np.nan) if adtv_row is not None else None
+                slip_pct = liquidity.slippage_pct(trade_value_quoted, adtv)
+                day_slippage += trade_value_quoted * slip_pct
 
                 if delta > 0:
-                    c = costs.buy_cost(trade_value)
+                    effective_price = px * (1 + slip_pct)  # market impact pushes the price UP against a buyer
+                    trade_value = delta * effective_price
+                    day_turnover += trade_value
+                    c = costs.buy_cost(trade_value, cost_config)
                     cash -= trade_value + c
                     day_cost += c
                     if shares[a] > 0 and entry_price[a] is not None:
                         # blended cost basis for the added tranche; keep original entry date
                         new_shares = shares[a] + delta
-                        entry_price[a] = (shares[a] * entry_price[a] + delta * px) / new_shares
+                        entry_price[a] = (shares[a] * entry_price[a] + delta * effective_price) / new_shares
                     else:
-                        entry_price[a] = px
+                        entry_price[a] = effective_price
                         entry_date[a] = d
                     shares[a] = shares[a] + delta
                 else:
+                    effective_price = px * (1 - slip_pct)  # market impact pushes the price DOWN against a seller
                     sell_shares = -delta
+                    trade_value = sell_shares * effective_price
+                    day_turnover += trade_value
                     full_exit = target_shares <= 1e-9
-                    c = costs.sell_cost(trade_value, full_exit)
+                    c = costs.sell_cost(trade_value, full_exit, cost_config)
                     proceeds = trade_value
                     cash += proceeds - c
                     day_cost += c
 
                     if entry_price[a] is not None:
-                        gain = sell_shares * (px - entry_price[a])
+                        gain = sell_shares * (effective_price - entry_price[a])
                         holding_days = (d - entry_date[a]).days if entry_date[a] is not None else 0
-                        fy = costs.fiscal_year(d)
-                        tax = costs.capital_gains_tax(gain, holding_days, fy, fy_ltcg_used)
+                        fy = costs.fiscal_year(d, fy_start_month)
+                        tax = costs.capital_gains_tax(gain, holding_days, fy, fy_ltcg_used, cost_config)
                         cash -= tax
                         day_tax += tax
 
@@ -126,15 +152,31 @@ def run_backtest(open_px: pd.DataFrame, close_px: pd.DataFrame, target_weights: 
         n_held = 0
         for a in assets:
             px = c_row.get(a, np.nan)
+            if not pd.isna(px):
+                last_valid_close[a] = px
             if shares[a] > 0:
                 if pd.isna(px):
-                    px = entry_price[a] if entry_price[a] is not None else 0.0
+                    # A genuine mid-life gap (trading halt, corporate action
+                    # pause, vendor data hole -- found e.g. 115 such gap-days
+                    # across 45 tickers in this universe, not just an edge
+                    # case). Falling back to entry_price here was wrong: it
+                    # snaps the position to its purchase price for one day
+                    # regardless of how much it has moved since, then snaps
+                    # back to the real price once data resumes -- fabricating
+                    # a NAV round-trip out of a data gap, not a market move.
+                    # Carrying forward the last REAL observed close (flat
+                    # mark, no fake move) is the correct treatment, and
+                    # matches the ffill pattern already used everywhere else
+                    # in this codebase for this exact kind of gap.
+                    px = last_valid_close[a] if last_valid_close[a] is not None else (
+                        entry_price[a] if entry_price[a] is not None else 0.0)
                 holdings_value += shares[a] * px
                 n_held += 1
 
         nav = cash + holdings_value
         nav_hist.append(nav)
         cost_hist.append(day_cost)
+        slippage_hist.append(day_slippage)
         tax_hist.append(day_tax)
         turnover_hist.append(day_turnover)
         n_holdings_hist.append(n_held)
@@ -143,6 +185,7 @@ def run_backtest(open_px: pd.DataFrame, close_px: pd.DataFrame, target_weights: 
     result = pd.DataFrame({
         "nav": nav_hist,
         "cost": cost_hist,
+        "slippage": slippage_hist,
         "tax": tax_hist,
         "turnover": turnover_hist,
         "n_holdings": n_holdings_hist,

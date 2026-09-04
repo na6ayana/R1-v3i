@@ -61,7 +61,11 @@ def win_rate(rets: pd.Series) -> float:
     return (rets > 0).mean()
 
 
-def summary(nav: pd.Series, label: str = "") -> dict:
+def summary(nav: pd.Series, label: str = "", rf_annual: float = 0.06) -> dict:
+    """`rf_annual` defaults to 6% (a rough Indian risk-free-rate proxy);
+    pass a market-appropriate rate for other markets (e.g. ~0.04 for a US
+    Treasury-based rate) -- Sharpe/Sortino are excess-return ratios, so this
+    assumption does shift them a bit, unlike everything else in here."""
     rets = daily_returns(nav)
     return {
         "period": label,
@@ -70,8 +74,8 @@ def summary(nav: pd.Series, label: str = "") -> dict:
         "total_return_pct": total_return(nav) * 100,
         "cagr_pct": cagr(nav) * 100,
         "ann_vol_pct": annualized_vol(rets) * 100,
-        "sharpe": sharpe_ratio(rets),
-        "sortino": sortino_ratio(rets),
+        "sharpe": sharpe_ratio(rets, rf_annual),
+        "sortino": sortino_ratio(rets, rf_annual),
         "max_drawdown_pct": max_drawdown(nav) * 100,
         "calmar": calmar_ratio(nav),
         "win_rate_pct": win_rate(rets) * 100,

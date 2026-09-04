@@ -62,7 +62,35 @@ DELISTED_HISTORICAL = [
     "GVKPIL.NS", "EDUCOMP.NS", "ABAN.NS", "GTLINFRA.NS", "ALOKINDS.NS",
 ]
 
-UNIVERSE = CURRENT_NIFTY100 + DELISTED_HISTORICAL
+# Current Nifty 50 constituents (subset of CURRENT_NIFTY100), same NSE
+# official-list source, fetched 2026-09-03. Not the default UNIVERSE --
+# used for a narrower-universe comparison check (larger, more liquid
+# large-caps only, no delisted names).
+NIFTY50 = [
+    "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS", "AXISBANK.NS",
+    "BAJAJ-AUTO.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS", "BEL.NS", "BHARTIARTL.NS",
+    "CIPLA.NS", "COALINDIA.NS", "DRREDDY.NS", "EICHERMOT.NS", "ETERNAL.NS",
+    "GRASIM.NS", "HCLTECH.NS", "HDFCBANK.NS", "HDFCLIFE.NS", "HINDALCO.NS",
+    "HINDUNILVR.NS", "ICICIBANK.NS", "ITC.NS", "INFY.NS", "INDIGO.NS",
+    "JSWSTEEL.NS", "JIOFIN.NS", "KOTAKBANK.NS", "LT.NS", "M&M.NS",
+    "MARUTI.NS", "MAXHEALTH.NS", "NTPC.NS", "NESTLEIND.NS", "ONGC.NS",
+    "POWERGRID.NS", "RELIANCE.NS", "SBILIFE.NS", "SHRIRAMFIN.NS", "SBIN.NS",
+    "SUNPHARMA.NS", "TCS.NS", "TATACONSUM.NS", "TMPV.NS", "TATASTEEL.NS",
+    "TECHM.NS", "TITAN.NS", "TRENT.NS", "ULTRACEMCO.NS", "WIPRO.NS",
+]
+
+# Kept OUT of UNIVERSE by default. A direct comparison showed these 10 names
+# were doing a disproportionate share of the work: Total_Rank IC t-stat was
+# 2.92 with them included vs. 1.75 (below the conventional significance bar)
+# on CURRENT_NIFTY100 alone. Their extreme, one-off collapse events (RCOM,
+# HDIL, JETAIRWAYS, etc. crashing 90%+) are easy for a downside-deviation/
+# momentum ranking to "catch" retrospectively, but that's a different, less
+# repeatable effect than genuine cross-sectional skill among ordinary
+# large-caps -- and it's exactly the kind of result a full-period aggregate
+# number can hide. DELISTED_HISTORICAL is kept defined (not deleted) since
+# it's still valid, researched survivorship-bias-reduction data; add it back
+# via UNIVERSE = CURRENT_NIFTY100 + DELISTED_HISTORICAL if wanted again.
+UNIVERSE = CURRENT_NIFTY100
 
 BENCHMARK = "^NSEI"  # Nifty 50 index
 
@@ -92,15 +120,23 @@ CACHE_DIR = "data_cache"
 MOMENTUM_WINDOW = 231
 MOMENTUM_SKIP = 21
 
-# Was 10 days (~2 weeks): a short realized-vol estimate being asked to
-# predict a return 3 months out (REBALANCE_FREQ="QE") -- a horizon mismatch,
-# and likely why Rank_V's IC weakened once rebalancing moved from monthly to
-# quarterly (t=2.05 -> 0.80). The academic low-volatility anomaly is
-# typically measured over 6-12 months of daily returns, not 2 weeks; 63
-# trading days (~1 quarter) roughly matches the rebalance horizon instead.
+# Only used by yang_zhang_volatility/downside_deviation, which are no
+# longer in the active pipeline (replaced by idiosyncratic_volatility below,
+# see BETA_WINDOW) -- kept for reference. A lengthened-window experiment
+# (63 days, to better match REBALANCE_FREQ="QE") was tried and reverted: it
+# made Rank_V's IC WORSE, not better (t=0.80 -> 0.50), so 10 is intentional,
+# not a leftover default.
 VOLATILITY_WINDOW = 10
 VOLUME_FAST = 10
 VOLUME_SLOW = 22
+
+# Beta / idiosyncratic-volatility factors (Frazzini-Pedersen "Betting
+# Against Beta"; Ang-Hodrick-Xing-Zhang idiosyncratic vol). 252 trading days
+# (~1 year) rolling window against Nifty 50 -- these are risk-regime
+# characteristics, not short-term signals, so they need a substantially
+# longer window than the price/volume factors above to be estimated
+# reliably; a beta estimated over 10-63 days is mostly noise.
+BETA_WINDOW = 252
 
 W1, W2, W3 = 0.3, 0.3, 0.3  # weight on Rank_M, Rank_V, Rank_VC
 X = 10                        # divisor for the M/x tiebreak term
@@ -191,3 +227,17 @@ COSTS = {
 }
 
 INITIAL_CAPITAL = 10_000_000.0  # INR 1 crore notional
+
+# --- Market impact / slippage -----------------------------------------------
+# Audit finding: no slippage model existed at all -- every trade executed at
+# the exact quoted price regardless of size. Checked against real ADTV: a
+# single TOP_N position at the backtest's ending NAV was ~10% of a day's
+# volume for the least-liquid current constituents, large enough that real
+# execution would move the price. Modeled with the standard square-root
+# market-impact form (see liquidity.py): slippage_pct = SLIPPAGE_COEF *
+# sqrt(trade_value / trailing_60d_ADTV), capped at SLIPPAGE_MAX_PCT.
+# SLIPPAGE_COEF=0.01 is a rough, disclosed calibration (not fit to Indian
+# market microstructure data, which isn't available here) -- treat the
+# resulting numbers as "plausible order of magnitude," not precise.
+SLIPPAGE_COEF = 0.01
+SLIPPAGE_MAX_PCT = 0.05

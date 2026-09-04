@@ -9,17 +9,17 @@ import yfinance as yf
 import config
 
 
-def _cache_path(ticker: str) -> str:
+def _cache_path(ticker: str, cache_dir: str) -> str:
     # ".NS" / "&" etc are filesystem-safe as-is on Windows/Linux; ticker
     # names here are simple enough (letters, digits, "-", "&", ".") that no
     # extra escaping is needed.
-    return os.path.join(config.CACHE_DIR, f"{ticker}.csv")
+    return os.path.join(cache_dir, f"{ticker}.csv")
 
 
-def _load_from_cache(ticker: str):
+def _load_from_cache(ticker: str, cache_dir: str):
     """Return a cached OHLCV DataFrame if it exists and was written today,
     else None (meaning: go fetch it from yfinance)."""
-    path = _cache_path(ticker)
+    path = _cache_path(ticker, cache_dir)
     if not os.path.exists(path):
         return None
     mtime = date.fromtimestamp(os.path.getmtime(path))
@@ -29,12 +29,12 @@ def _load_from_cache(ticker: str):
     return df
 
 
-def _save_to_cache(ticker: str, df: pd.DataFrame):
-    os.makedirs(config.CACHE_DIR, exist_ok=True)
-    df.to_csv(_cache_path(ticker))
+def _save_to_cache(ticker: str, df: pd.DataFrame, cache_dir: str):
+    os.makedirs(cache_dir, exist_ok=True)
+    df.to_csv(_cache_path(ticker, cache_dir))
 
 
-def download_universe(tickers):
+def download_universe(tickers, cache_dir=None):
     """Download each ticker's FULL available OHLCV history. Returns dict[ticker] -> DataFrame.
 
     Assets are NOT forced onto a common start date: each stock's frame
@@ -63,16 +63,19 @@ def download_universe(tickers):
     than carrying negative prices into log-based factor math.
 
     Each ticker's resolved OHLCV frame (whichever of the above paths it
-    took) is cached to a per-ticker CSV under config.CACHE_DIR (see
-    _load_from_cache / _save_to_cache) so re-running the backtest the same
-    day doesn't re-hit yfinance for ~110 tickers every time.
+    took) is cached to a per-ticker CSV under `cache_dir` (defaults to
+    config.CACHE_DIR; pass a different dir for a different market's
+    universe, e.g. nasdaq_config.CACHE_DIR, to keep caches separate) so
+    re-running the backtest the same day doesn't re-hit yfinance for
+    ~100+ tickers every time.
     """
+    cache_dir = config.CACHE_DIR if cache_dir is None else cache_dir
     data = {}
     skipped = []
     fell_back_to_raw = []
     from_cache = 0
     for t in tickers:
-        cached = _load_from_cache(t)
+        cached = _load_from_cache(t, cache_dir)
         if cached is not None:
             data[t] = cached
             from_cache += 1
@@ -103,9 +106,9 @@ def download_universe(tickers):
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.index = pd.to_datetime(df.index).tz_localize(None)
         data[t] = df
-        _save_to_cache(t, df)
+        _save_to_cache(t, df, cache_dir)
     if from_cache:
-        print(f"  Loaded {from_cache} ticker(s) from today's local cache ({config.CACHE_DIR}/)")
+        print(f"  Loaded {from_cache} ticker(s) from today's local cache ({cache_dir}/)")
     if fell_back_to_raw:
         print(f"  Fell back to raw (unadjusted) prices for {len(fell_back_to_raw)} "
               f"ticker(s) with a broken auto-adjust series: {', '.join(fell_back_to_raw)}")
@@ -141,16 +144,46 @@ def fix_invalid_open(data: dict) -> dict:
     return cleaned
 
 
-def drop_muhurat_days(data: dict) -> dict:
-    """Remove NSE Muhurat-trading calendar dates from every asset's history."""
-    muhurat = pd.to_datetime(config.MUHURAT_TRADING_DATES)
+def drop_non_trading_weekdays(data: dict) -> dict:
+    """Drop any Saturday/Sunday rows from the raw vendor data.
+
+    NSE does not hold regular weekend sessions -- the one exception,
+    Diwali Muhurat trading, is a specific known calendar date handled by
+    drop_muhurat_days, not a general weekend pattern. A weekend-dated row
+    in the raw feed is a data error (a mis-timestamped Friday close or
+    Monday open, or similar vendor glitch), not a real trading session.
+
+    Left in, a single such row for even ONE ticker corrupts the union-based
+    multi-asset panel: on that phantom "day," every other held asset has no
+    price at all and falls back to its entry price for mark-to-market,
+    while the one bad ticker marks-to-market off a real (or semi-real)
+    price -- producing a spurious spike-then-revert in portfolio NAV.
+    Found via a genuine case: a Saturday 2010-02-06 row present for exactly
+    1 of 50 Nifty 50 tickers, which alone produced a false +37.8%/-26.4%
+    two-day portfolio NAV swing that survived winsorization (winsorization
+    checks each ticker's OWN return magnitude, not whether the calendar
+    date it's dated on is a real trading day shared by other assets).
+    """
+    cleaned = {}
+    for t, df in data.items():
+        cleaned[t] = df[df.index.dayofweek < 5].copy()
+    return cleaned
+
+
+def drop_muhurat_days(data: dict, muhurat_dates=None) -> dict:
+    """Remove NSE Muhurat-trading calendar dates from every asset's history.
+    `muhurat_dates` defaults to config.MUHURAT_TRADING_DATES (India); pass
+    an empty list for markets with no such exception (e.g. the US)."""
+    dates = config.MUHURAT_TRADING_DATES if muhurat_dates is None else muhurat_dates
+    muhurat = pd.to_datetime(dates)
     cleaned = {}
     for t, df in data.items():
         cleaned[t] = df[~df.index.normalize().isin(muhurat)].copy()
     return cleaned
 
 
-def winsorize_returns(data: dict, lower=config.WINSOR_LOWER_PCTL, upper=config.WINSOR_UPPER_PCTL) -> dict:
+def winsorize_returns(data: dict, lower=config.WINSOR_LOWER_PCTL, upper=config.WINSOR_UPPER_PCTL,
+                       abs_return_cap=None) -> dict:
     """Winsorize each asset's OHLC bars based on its own daily-return tails.
 
     A day whose Close-to-Close return falls below the `lower` percentile or
@@ -195,7 +228,7 @@ def winsorize_returns(data: dict, lower=config.WINSOR_LOWER_PCTL, upper=config.W
         lo_series = raw_ret.expanding(min_periods=min_periods).quantile(lower).to_numpy()
         hi_series = raw_ret.expanding(min_periods=min_periods).quantile(upper).to_numpy()
 
-        cap = config.WINSOR_ABS_RETURN_CAP
+        cap = config.WINSOR_ABS_RETURN_CAP if abs_return_cap is None else abs_return_cap
         adj_close = raw_close.copy()
         for i in range(1, len(adj_close)):
             prev_adj = adj_close[i - 1]
@@ -219,11 +252,31 @@ def winsorize_returns(data: dict, lower=config.WINSOR_LOWER_PCTL, upper=config.W
     return cleaned
 
 
-def clean_data(raw: dict) -> dict:
-    step0 = fix_invalid_open(raw)
-    step1 = drop_muhurat_days(step0)
-    step2 = winsorize_returns(step1)
+def clean_data(raw: dict, muhurat_dates=None, winsor_abs_cap=None) -> dict:
+    step_weekday = drop_non_trading_weekdays(raw)
+    step0 = fix_invalid_open(step_weekday)
+    step1 = drop_muhurat_days(step0, muhurat_dates)
+    step2 = winsorize_returns(step1, abs_return_cap=winsor_abs_cap)
     return step2
+
+
+def first_date_with_min_coverage(close: pd.DataFrame, min_tickers: int) -> pd.Timestamp:
+    """First date on which at least `min_tickers` assets in `close` have
+    valid (non-NaN) data.
+
+    Matters when a universe is defined by TODAY's constituents but the data
+    goes back much further than most of those constituents' listing dates
+    (found on Nasdaq-100: only 28-56 of the current 102 names existed at
+    all between 1986-1997). Before enough of the universe exists, every
+    pick is drawn from an ever-smaller pool that's, by construction,
+    pre-filtered for "eventually became a 40-year mega-cap winner" -- a
+    much more severe form of the survivorship bias already present in
+    "current constituents only" than a normal-sized universe has. Capping
+    the backtest start here (in addition to any benchmark-availability
+    floor) keeps that amplified-bias stretch out of the reported numbers."""
+    counts = close.notna().sum(axis=1)
+    valid = counts[counts >= min_tickers]
+    return valid.index[0] if len(valid) else close.index[0]
 
 
 def split_dates(all_dates: pd.DatetimeIndex):
